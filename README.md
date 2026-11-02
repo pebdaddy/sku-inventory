@@ -15,10 +15,11 @@ or ACR reporting application are required to run the exporter.
 
 ## Quick start
 
-From this project directory in PowerShell:
+In PowerShell, navigate to the folder where you cloned or extracted this project.
+Replace the placeholder below with that folder's actual path:
 
 ```powershell
-Set-Location C:\dev\sku-inventory
+Set-Location '<path-to-project-folder>'
 $tenant = '<customer-tenant-GUID>'
 az login --tenant $tenant
 az account list --all --output table
@@ -102,45 +103,16 @@ and selected subscription scope, without following HTTP redirects.
   Reader access on all intended subscriptions is recommended.
 - Do not interpret an empty or partial inventory as proof that a service is absent.
 
-## Using the inventory for regional validation
-
-1. Review the collected resources and deployed SKUs.
-2. Resolve the exact required configuration, including feature combinations.
-3. Query the service-specific regional SKU/capability APIs for each target region.
-4. Keep catalogue support separate from customer eligibility, quota and actual
-   deployment capacity.
-
-This export is **current deployment configuration**, not historical billing
-reconstruction or a target-region availability result.
-
 ## Tests
 
-Tests use synthetic Azure responses only; they never authenticate or query Azure.
-
-Run the PowerShell tests without Python:
-
-```powershell
-$testDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
-New-Item -ItemType Directory -Path $testDirectory | Out-Null
-powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-  -File .\tests\test_service_sku_export.ps1 `
-  -TestDirectory $testDirectory
-```
-
-The test directory contains synthetic exports and can be removed after inspection.
-Alternatively, with Python installed:
+With Python installed, run from the project folder on Windows:
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
 
-The Python wrapper creates and cleans up its own temporary directory. It invokes
-Windows PowerShell and skips the test on non-Windows platforms.
-
-Coverage includes tenant/subscription scoping, all supported parent resource
-types, child and discovery pagination, deduplication, field allowlisting,
-missing child types, workspace table exclusion, metadata validation, token exclusion, partial failures,
-CSV outputs, syntax and embedded help.
+Tests use synthetic responses, never connect to Azure, and clean up their
+temporary files automatically.
 
 ## Project files
 
