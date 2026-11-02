@@ -16,6 +16,8 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     (Join-Path $PSScriptRoot '..\Export-ServiceSkuInventory.ps1'), [ref]$tokens, [ref]$parseErrors)
 Assert-Test ($parseErrors.Count -eq 0) 'standalone script syntax'
 Assert-Test ($null -ne $ast.GetHelpContent() -and $ast.GetHelpContent().Examples.Count -eq 2) 'portable usage help'
+Assert-Test (@($ast.ParamBlock.Parameters.Name.VariablePath.UserPath) -notcontains 'RankingCsv') 'script has no ranking input'
+Assert-Test (-not (Get-Command Export-ServiceSkuInventory).Parameters.ContainsKey('Ranking')) 'export function has no ranking input'
 
 function az { throw 'Real Azure CLI must never be invoked in synthetic tests.' }
 function Invoke-SkuAzureCli {
@@ -119,29 +121,17 @@ function Invoke-RestMethod {
     if ($script:FailureMode -eq 'Storage' -and $path -eq $storage) {
         throw [System.Net.WebException]::new('Synthetic resource failure')
     }
-    if ($path -eq "$workspace/tables") {
-        $tableName = 'SyntheticAnalytics'
-        $plan = 'Analytics'
-        $next = "https://management.azure.com$workspace/tables?api-version=2022-10-01&skip=second"
-        if ($Uri.Query -match 'skip=second') { $tableName = 'SyntheticBasic'; $plan = 'Basic'; $next = $null }
-        return [pscustomobject]@{
-            value = @([pscustomobject]@{
-                id = "$workspace/tables/$tableName"; name = $tableName
-                type = 'Microsoft.OperationalInsights/workspaces/tables'
-                properties = [pscustomobject]@{ plan = $plan; retentionInDays = 30; schema = 'TABLE_SCHEMA_SENTINEL' }
-            })
-            nextLink = $next
-        }
-    }
     if ($path -eq "$vnet/virtualNetworkPeerings") {
+        $peerName = 'syntheticpeer'
+        $next = "https://management.azure.com$vnet/virtualNetworkPeerings?api-version=2024-05-01&skip=second"
+        if ($Uri.Query -match 'skip=second') { $peerName = 'syntheticpeer2'; $next = $null }
         return [pscustomobject]@{ value = @([pscustomobject]@{
-            id = "$vnet/virtualNetworkPeerings/syntheticpeer"; name = 'syntheticpeer'
-            type = 'Microsoft.Network/virtualNetworks/virtualNetworkPeerings'
+            id = "$vnet/virtualNetworkPeerings/$peerName"; name = $peerName
             properties = [pscustomobject]@{
                 remoteVirtualNetwork = [pscustomobject]@{ id = "$prefix/Microsoft.Network/virtualNetworks/remote" }
                 peeringState = 'Connected'
             }
-        }) }
+        }); nextLink = $next }
     }
     if ($script:Resources.ContainsKey($path)) { return $script:Resources[$path] }
     throw "Unexpected synthetic HTTP request: $Uri"
@@ -159,28 +149,15 @@ foreach ($invalid in @(
     Assert-Test $rejected 'unsafe request rejected'
 }
 
-$ranking = Join-Path $TestDirectory 'synthetic-ranking.csv'
-@'
-category,rank,serviceLevel2,serviceLevel4,sku
-Non-VM,1,Storage,Blob,Cool
-Non-VM,2,GitHub,Copilot,Business
-Non-VM,3,Synthetic unmapped,Product,Tier
-Non-VM,21,Storage,Blob,Hot
-VM,1,Virtual Machines,Family,D4s v5
-'@ | Set-Content -LiteralPath $ranking -Encoding UTF8
-
 $script:FailureMode = ''
 $output = Join-Path $TestDirectory 'complete'
-Export-ServiceSkuInventory -Tenant $tenant -Output $output -Ranking $ranking
+Export-ServiceSkuInventory -Tenant $tenant -Output $output
 $jsonText = Get-Content -LiteralPath (Join-Path $output 'service-sku-inventory.json') -Raw
 $result = $jsonText | ConvertFrom-Json
 Assert-Test ($result.status -eq 'Collected') 'successful collection status'
 Assert-Test (@($result.subscriptions).Count -eq 1) 'foreign and disabled subscriptions excluded'
-Assert-Test (@($result.resources).Count -eq 16) 'parent and paginated child inventory'
-Assert-Test (@($result.requirements).Count -eq 3) 'only top-20 non-VM requirements retained'
-Assert-Test (@($result.requirements[0].candidateResourceIds).Count -eq 1) 'deduplicated resource candidates'
-Assert-Test ($result.requirements[1].status -like 'Not regional*') 'non-regional billing identified'
-Assert-Test ($result.requirements[2].status -like 'No extractor mapping*') 'unmapped product explicit'
+Assert-Test (@($result.resources).Count -eq 15) 'parent and paginated child inventory'
+Assert-Test ($null -eq $result.PSObject.Properties['requirements']) 'inventory contains no billing requirements'
 Assert-Test ($result.failures.Count -eq 0) 'no hidden failures'
 Assert-Test ($jsonText -notmatch 'SENTINEL|SYNTHETIC_TOKEN|TABLE_SCHEMA') 'secrets and non-allowlisted fields excluded'
 $records = @{}
@@ -199,10 +176,34 @@ Assert-Test ($records[$pool].configuration.'perDatabaseSettings.maxCapacity' -eq
 Assert-Test ($records[$nat].sku.name -eq 'Standard') 'NAT Gateway SKU'
 Assert-Test ($records[$private].configuration.connections[0].groupIds[0] -eq 'blob') 'Private Link target group'
 Assert-Test ($records[$cluster].sku.capacity -eq 500) 'dedicated log cluster commitment'
-Assert-Test (@($result.resources | Where-Object { $_.type -eq 'Microsoft.OperationalInsights/workspaces/tables' }).Count -eq 2) 'Log Analytics table plans paginated'
-Assert-Test (@(Import-Csv -LiteralPath (Join-Path $output 'service-sku-inventory.csv')).Count -eq 16) 'CSV inventory complete'
+Assert-Test (@($script:Requests | Where-Object { ([uri]$_.uri).AbsolutePath -like "$workspace/*" }).Count -eq 0) 'workspace table catalogue not requested'
+Assert-Test (@($result.resources | Where-Object { $_.type -eq 'Microsoft.OperationalInsights/workspaces/tables' }).Count -eq 0) 'JSON excludes workspace table catalogue'
+$peers = @($result.resources | Where-Object { $_.type -eq 'Microsoft.Network/virtualNetworks/virtualNetworkPeerings' })
+Assert-Test ($peers.Count -eq 2) 'VNet peerings paginated with missing child types'
+Assert-Test ($peers[0].configuration.'remoteVirtualNetwork.id' -eq "$prefix/Microsoft.Network/virtualNetworks/remote") 'peering target preserved'
+Assert-Test ($peers[0].configuration.peeringState -eq 'Connected') 'peering state preserved'
+$csvRecords = @(Import-Csv -LiteralPath (Join-Path $output 'service-sku-inventory.csv'))
+Assert-Test ($csvRecords.Count -eq 15) 'CSV inventory complete'
+Assert-Test (@($csvRecords | Where-Object { $_.type -eq 'Microsoft.OperationalInsights/workspaces/tables' }).Count -eq 0) 'CSV excludes workspace table catalogue'
 Assert-Test (@($script:Requests | Where-Object { $_.method -eq 'GET' -and ([uri]$_.uri).AbsolutePath -eq $storage }).Count -eq 1) 'duplicate discovery row not queried twice'
 Assert-Test ($script:SkuTokenCache.Count -eq 0) 'token cache cleared after export'
+
+$childDefinition = @{ Fields = @('remoteVirtualNetwork.id', 'peeringState') }
+$childId = "$vnet/virtualNetworkPeerings/SyntheticMissingType"
+$childRecord = ConvertTo-ServiceSkuRecord ([pscustomobject]@{ id = $childId; name = 'SyntheticMissingType' }) `
+    $childDefinition 'Synthetic' $vnet 'Microsoft.Network/virtualNetworks/virtualNetworkPeerings'
+Assert-Test ($childRecord.type -eq 'Microsoft.Network/virtualNetworks/virtualNetworkPeerings') 'missing child type derived from known endpoint'
+foreach ($invalid in @(
+    @{ Resource = [pscustomobject]@{ id = $storage }; ParentId = ''; ExpectedType = '' },
+    @{ Resource = [pscustomobject]@{ type = 'Microsoft.Storage/storageAccounts' }; ParentId = ''; ExpectedType = '' },
+    @{ Resource = [pscustomobject]@{ id = $childId; type = 'Microsoft.Storage/storageAccounts' }
+        ParentId = $vnet; ExpectedType = 'Microsoft.Network/virtualNetworks/virtualNetworkPeerings' }
+)) {
+    $rejected = $false
+    try { ConvertTo-ServiceSkuRecord -Definition $childDefinition -SubscriptionName 'Synthetic' @invalid | Out-Null }
+    catch [System.Management.Automation.RuntimeException] { $rejected = $true }
+    Assert-Test $rejected 'missing parent metadata and mismatched child type rejected'
+}
 
 $scopeRejected = $false
 try { Export-ServiceSkuInventory -Tenant $tenant -Output (Join-Path $TestDirectory 'wrong') -Subscriptions @([guid]$foreign) }

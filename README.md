@@ -49,29 +49,6 @@ or modify Azure configuration.
 Every requested subscription must be enabled and visible in the specified tenant;
 otherwise the script fails before discovery.
 
-### Optional ACR ranking input
-
-An existing `sku-ranking.csv` from the ACR reporting application can be supplied:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File .\Export-ServiceSkuInventory.ps1 `
-  -TenantId $tenant `
-  -OutputDirectory .\output\mobiliar `
-  -RankingCsv C:\dev\acr-workload-reporting\output\mobiliar\reports\service-details\sku-ranking.csv
-```
-
-This adds the top 20 **non-VM** billing entries and candidate resource IDs to the
-JSON `requirements` list. It does not filter resource collection or automatically
-attribute billed consumption to resources.
-
-Required ranking columns: `category`, `rank`, `serviceLevel2`, `serviceLevel4`,
-and `sku`. Only `Non-VM` rows with ranks 1 through 20 are used.
-
-The ranking file remains owned by the reporting application. It is not bundled
-with this project. For customer-side execution, copy it only with customer
-approval or omit `-RankingCsv`.
-
 ## Collected configuration
 
 | Service | Fields collected |
@@ -79,7 +56,7 @@ approval or omit `-RankingCsv`.
 | Storage | Deployment SKU/redundancy, kind, default access tier, hierarchical namespace and NFS flags |
 | App Service | Plan SKU/tier/capacity, Linux (`reserved`) flag, hosting environment and zone redundancy |
 | SQL Database / elastic pools | SKU, tier, hardware family, capacity, service objective, pool link, licensing, serverless settings and zone redundancy |
-| Azure Monitor / Log Analytics | Workspace commitment tier, dedicated-cluster capacity and per-table plan metadata |
+| Azure Monitor / Log Analytics | Workspace SKU/commitment tier, retention and dedicated-cluster capacity |
 | Databricks | Workspace SKU and workspace hostname |
 | AKS | Cluster tier, Kubernetes/network settings and node-pool VM sizes, OS, scaling and zones |
 | Firewall / NAT Gateway | Exact resource SKU and configured zones |
@@ -96,14 +73,13 @@ Two files are written to `-OutputDirectory`. **Reruns overwrite these files**;
 use a different directory to preserve previous snapshots.
 
 - `service-sku-inventory.json`: scope, timestamps, collection status, resource
-  configurations, request failures, limitations, and optional ranking
-  requirements with candidate resource IDs.
+  configurations, request failures, and limitations.
 - `service-sku-inventory.csv`: one row per collected resource, with common SKU
   columns and a `configurationJson` column for service-specific details.
 
-Keep exports in a customer-approved location. They contain customer resource
-names, IDs, workspace hostnames, and configuration. Do not commit customer exports
-or customer ranking files to source control.
+Keep exports in a approved location. They contain resource
+names, IDs, workspace hostnames, and configuration. Do not commit exports
+to source control.
 
 Only allowlisted metadata fields are exported. No access tokens, keys,
 certificates, application settings, log records, blob contents, or table schemas
@@ -117,6 +93,9 @@ and selected subscription scope, without following HTTP redirects.
   `Partial`, and the script exits unsuccessfully after saving collected results.
 - Authentication failures, invalid scope, malformed responses, and invalid
   pagination stop execution rather than producing successful-looking results.
+- Child responses that omit `type` use the known parent type and child endpoint
+  (for example, virtual network peerings). IDs are still required, and
+  conflicting types are rejected.
 - A `Collected` status means the requests completed, **not** that the inventory
   covers every resource in the tenant.
 - Resource-scoped permissions may silently limit Resource Graph discovery.
@@ -125,25 +104,14 @@ and selected subscription scope, without following HTTP redirects.
 
 ## Using the inventory for regional validation
 
-1. Review resource candidates against the billed products and tiers.
+1. Review the collected resources and deployed SKUs.
 2. Resolve the exact required configuration, including feature combinations.
 3. Query the service-specific regional SKU/capability APIs for each target region.
 4. Keep catalogue support separate from customer eligibility, quota and actual
    deployment capacity.
 
 This export is **current deployment configuration**, not historical billing
-reconstruction or a target-region availability result. It does not automatically
-update the reporting application's availability table.
-
-Remaining evidence gaps:
-
-- Databricks cluster/job/pool node types, SQL warehouse sizes and serverless
-  settings require separate workspace API access; ARM provides workspace metadata.
-- A Storage account's default tier does not establish each blob's access tier.
-  Individual blobs are deliberately not enumerated.
-- GitHub Copilot plans and AI Credits require GitHub billing/admin evidence and
-  are not regional Azure deployment SKUs.
-- Quota, real-time capacity and all feature combinations need separate validation.
+reconstruction or a target-region availability result.
 
 ## Tests
 
@@ -171,7 +139,8 @@ Windows PowerShell and skips the test on non-Windows platforms.
 
 Coverage includes tenant/subscription scoping, all supported parent resource
 types, child and discovery pagination, deduplication, field allowlisting,
-token exclusion, partial failures, CSV outputs, syntax and embedded help.
+missing child types, workspace table exclusion, metadata validation, token exclusion, partial failures,
+CSV outputs, syntax and embedded help.
 
 ## Project files
 

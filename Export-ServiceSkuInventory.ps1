@@ -8,13 +8,12 @@ Run in Windows PowerShell 5.1 after az login --tenant <tenant GUID>.
 Reader access on the selected subscriptions is recommended. Uses Azure CLI authentication,
 read-only Resource Graph queries and ARM GET requests; no deployments or provider registration.
 Exports allowlisted fields to service-sku-inventory.json and service-sku-inventory.csv.
-Optional RankingCsv adds top-20 non-VM billing entries and candidate resource IDs for review.
 This is current configuration, not historical billing attribution or regional SKU verification.
 Databricks compute and GitHub billing require separate evidence. Tokens and keys are not exported.
 .EXAMPLE
 .\Export-ServiceSkuInventory.ps1 -TenantId '<tenant GUID>' -OutputDirectory '.\sku-inventory'
 .EXAMPLE
-.\Export-ServiceSkuInventory.ps1 -TenantId '<tenant GUID>' -SubscriptionId @('<subscription GUID>') -OutputDirectory '.\sku-inventory' -RankingCsv '.\sku-ranking.csv'
+.\Export-ServiceSkuInventory.ps1 -TenantId '<tenant GUID>' -SubscriptionId @('<subscription GUID>') -OutputDirectory '.\sku-inventory'
 #>
 [CmdletBinding()]
 param(
@@ -22,8 +21,7 @@ param(
     [guid]$TenantId,
     [Parameter(Mandatory = $true)]
     [string]$OutputDirectory,
-    [guid[]]$SubscriptionId,
-    [string]$RankingCsv
+    [guid[]]$SubscriptionId
 )
 
 $ErrorActionPreference = 'Stop'
@@ -122,67 +120,76 @@ function Invoke-SkuArmRequest {
 function Get-ServiceSkuDefinitions {
     return @{
         'microsoft.storage/storageaccounts' = @{
-            Api = '2023-05-01'; Services = @('Storage')
+            Api = '2023-05-01'
             Fields = @('accessTier', 'isHnsEnabled', 'isNfsV3Enabled', 'largeFileSharesState')
         }
         'microsoft.web/serverfarms' = @{
-            Api = '2023-12-01'; Services = @('Azure App Service')
+            Api = '2023-12-01'
             Fields = @('reserved', 'hyperV', 'zoneRedundant', 'hostingEnvironmentProfile.id', 'isXenon')
         }
         'microsoft.sql/servers/databases' = @{
-            Api = '2023-08-01'; Services = @('SQL Database')
+            Api = '2023-08-01'
             Fields = @('currentServiceObjectiveName', 'requestedServiceObjectiveName', 'elasticPoolId',
                 'licenseType', 'computeModel', 'minCapacity', 'autoPauseDelay', 'maxSizeBytes',
                 'zoneRedundant', 'readScale', 'currentBackupStorageRedundancy', 'availabilityZone')
         }
         'microsoft.sql/servers/elasticpools' = @{
-            Api = '2023-08-01'; Services = @('SQL Database')
+            Api = '2023-08-01'
             Fields = @('perDatabaseSettings.minCapacity', 'perDatabaseSettings.maxCapacity',
                 'licenseType', 'zoneRedundant', 'maxSizeBytes')
         }
         'microsoft.operationalinsights/workspaces' = @{
-            Api = '2023-09-01'; Services = @('Azure Monitor', 'Log Analytics')
+            Api = '2023-09-01'
             Fields = @('retentionInDays', 'features.enableDataExport', 'defaultDataCollectionRuleResourceId')
-            PropertySku = $true; Child = 'tables'; ChildApi = '2022-10-01'
+            PropertySku = $true
         }
         'microsoft.operationalinsights/clusters' = @{
-            Api = '2022-10-01'; Services = @('Azure Monitor', 'Log Analytics'); Fields = @()
+            Api = '2022-10-01'; Fields = @()
         }
         'microsoft.databricks/workspaces' = @{
-            Api = '2024-05-01'; Services = @('Azure Databricks')
+            Api = '2024-05-01'
             Fields = @('workspaceUrl', 'isUcEnabled')
         }
         'microsoft.containerservice/managedclusters' = @{
-            Api = '2024-05-01'; Services = @('Azure Kubernetes Service')
+            Api = '2024-05-01'
             Fields = @('kubernetesVersion', 'networkProfile.networkPlugin', 'networkProfile.networkPluginMode',
                 'networkProfile.networkPolicy', 'networkProfile.loadBalancerSku')
         }
         'microsoft.network/azurefirewalls' = @{
-            Api = '2024-05-01'; Services = @('Azure Firewall'); Fields = @('firewallPolicy.id'); PropertySku = $true
+            Api = '2024-05-01'; Fields = @('firewallPolicy.id'); PropertySku = $true
         }
         'microsoft.network/natgateways' = @{
-            Api = '2024-05-01'; Services = @('NAT Gateway'); Fields = @('idleTimeoutInMinutes')
+            Api = '2024-05-01'; Fields = @('idleTimeoutInMinutes')
         }
         'microsoft.network/privateendpoints' = @{
-            Api = '2024-05-01'; Services = @('Virtual Network'); Fields = @()
+            Api = '2024-05-01'; Fields = @()
         }
         'microsoft.network/virtualnetworks' = @{
-            Api = '2024-05-01'; Services = @('Virtual Network'); Fields = @()
+            Api = '2024-05-01'; Fields = @()
             Child = 'virtualNetworkPeerings'; ChildApi = '2024-05-01'
         }
         'microsoft.apimanagement/service' = @{
-            Api = '2024-05-01'; Services = @('API Management')
+            Api = '2024-05-01'
             Fields = @('platformVersion', 'virtualNetworkType', 'natGatewayState')
         }
     }
 }
 
 function ConvertTo-ServiceSkuRecord {
-    param($Resource, $Definition, [string]$SubscriptionName, [string]$ParentId = '')
+    param($Resource, $Definition, [string]$SubscriptionName, [string]$ParentId = '', [string]$ExpectedType = '')
+    $id = [string]$Resource.id
+    $resourceType = [string]$Resource.type
+    if (-not $resourceType -and $ParentId -and $ExpectedType) { $resourceType = $ExpectedType }
+    if (-not $id -or -not $resourceType) {
+        throw "ARM returned resource metadata without an ID or type (resource ID: '$id'; parent ID: '$ParentId')."
+    }
+    if ($ExpectedType -and $resourceType -ne $ExpectedType) {
+        throw "ARM returned unexpected resource type '$resourceType' for '$id'; expected '$ExpectedType'."
+    }
     $sku = Get-SkuField $Resource 'sku'
     if ($Definition.PropertySku) { $sku = Get-SkuField $Resource 'properties.sku' }
     $configuration = Select-SkuFields (Get-SkuField $Resource 'properties') $Definition.Fields
-    $type = ([string]$Resource.type).ToLowerInvariant()
+    $type = $resourceType.ToLowerInvariant()
     if ($type -eq 'microsoft.containerservice/managedclusters') {
         $pools = @(foreach ($pool in (Get-SkuField $Resource 'properties.agentPoolProfiles')) {
             if ($null -ne $pool) {
@@ -214,12 +221,10 @@ function ConvertTo-ServiceSkuRecord {
         })
         $configuration | Add-Member -NotePropertyName connections -NotePropertyValue $connections
     }
-    $id = [string]$Resource.id
-    if (-not $id -or -not $Resource.type) { throw "ARM returned resource metadata without an ID or type." }
     return [pscustomobject]@{
         id = $id
         name = $Resource.name
-        type = $Resource.type
+        type = $resourceType
         subscriptionId = $id.Split('/')[2]
         subscriptionName = $SubscriptionName
         resourceGroup = $id.Split('/')[4]
@@ -234,7 +239,7 @@ function ConvertTo-ServiceSkuRecord {
 }
 
 function Export-ServiceSkuInventory {
-    param([guid]$Tenant, [string]$Output, [guid[]]$Subscriptions, [string]$Ranking)
+    param([guid]$Tenant, [string]$Output, [guid[]]$Subscriptions)
     if (-not (Get-Command az -ErrorAction SilentlyContinue)) { throw "Azure CLI is required. Install it and run az login first." }
     $cloud = Invoke-SkuAzureCli @('cloud', 'show')
     if ($cloud.name -ne 'AzureCloud') { throw "This exporter supports public Azure only." }
@@ -250,16 +255,6 @@ function Export-ServiceSkuInventory {
         $selected = @($selected | Where-Object { $_.id -in $requested })
     }
     if (-not $selected) { throw "No enabled subscriptions for tenant '$Tenant' are visible in Azure CLI. Sign in to that tenant first." }
-    $rankings = @()
-    if ($Ranking) {
-        $rankings = @(Import-Csv -LiteralPath $Ranking)
-        $required = @('category', 'rank', 'serviceLevel2', 'serviceLevel4', 'sku')
-        if (-not $rankings -or @($required | Where-Object { $_ -notin $rankings[0].PSObject.Properties.Name })) {
-            throw "Ranking CSV must contain category, rank, serviceLevel2, serviceLevel4 and sku columns."
-        }
-        $rankings = @($rankings | Where-Object { $_.category -eq 'Non-VM' -and [int]$_.rank -ge 1 -and [int]$_.rank -le 20 })
-        if (-not $rankings) { throw "Ranking CSV contains no top-20 non-VM entries." }
-    }
     $script:SkuTenant = $Tenant.ToString()
     $script:SkuTokenCache = @{}
     $definitions = Get-ServiceSkuDefinitions
@@ -297,6 +292,9 @@ function Export-ServiceSkuInventory {
                     Write-Warning "Resource metadata failed for '${id}': $($response.Error)"
                     continue
                 }
+                if (-not $response.Data.id -or -not $response.Data.type) {
+                    throw "ARM returned resource metadata without an ID or type for requested resource '$id'."
+                }
                 $resource = ConvertTo-ServiceSkuRecord $response.Data $definition $account.name
                 if ($resource.id -ne $id -or $resource.type -ne $item.type) { throw "ARM returned metadata for a different resource." }
                 $resources.Add($resource)
@@ -313,15 +311,13 @@ function Export-ServiceSkuInventory {
                         }
                         if ($null -eq $children.Data.PSObject.Properties['value']) { throw "Child-resource response has no value array." }
                         foreach ($child in $children.Data.value) {
-                            $childDefinition = @{ Fields = @('plan', 'retentionInDays', 'totalRetentionInDays') }
-                            if ($definition.Child -eq 'virtualNetworkPeerings') {
-                                $childDefinition.Fields = @('remoteVirtualNetwork.id', 'peeringState')
-                            }
+                            $childDefinition = @{ Fields = @('remoteVirtualNetwork.id', 'peeringState') }
                             if (-not ([string]$child.id).StartsWith("$id/", [StringComparison]::OrdinalIgnoreCase)) {
                                 throw "Child-resource response points outside its parent."
                             }
                             if ($seenResources.Add([string]$child.id)) {
-                                $resources.Add((ConvertTo-ServiceSkuRecord $child $childDefinition $account.name $id))
+                                $childType = "$($resource.type)/$($definition.Child)"
+                                $resources.Add((ConvertTo-ServiceSkuRecord $child $childDefinition $account.name $id $childType))
                             }
                         }
                         $next = [string]$children.Data.nextLink
@@ -336,26 +332,10 @@ function Export-ServiceSkuInventory {
         } while ($skip)
     }
 
-    $coverage = @(foreach ($row in $rankings) {
-        $matchingTypes = @($definitions.Keys | Where-Object { $row.serviceLevel2 -in $definitions[$_].Services })
-        $candidates = @($resources | Where-Object { ([string]$_.type).ToLowerInvariant() -in $matchingTypes })
-        $status = 'Resource candidates; billing-to-resource match requires review'
-        if ($row.serviceLevel2 -in @('GitHub', 'Bandwidth', 'Virtual Machines Licenses')) {
-            $status = 'Not regional; no Azure deployment SKU to extract'
-        }
-        elseif (-not $matchingTypes) { $status = 'No extractor mapping; manual review required' }
-        elseif (-not $candidates) { $status = 'No matching resources collected; check scope, permissions and historical usage' }
-        [pscustomobject]@{
-            rank = [int]$row.rank; service = $row.serviceLevel2; product = $row.serviceLevel4
-            billedSku = $row.sku; status = $status
-            candidateResourceIds = @($candidates | ForEach-Object { $_.id })
-        }
-    })
     $limitations = @(
         'Inventory is current configuration, not a reconstruction of historical ACR usage or a target-region availability check.',
         'Only enabled subscriptions visible to this Azure CLI identity in the requested tenant are included; tenant-wide completeness is not guaranteed.',
         'Reader access at each selected subscription is recommended. Resource-scoped access can produce an incomplete discovery set.',
-        'Resource candidates are not automatic billing-to-resource matches. Review all configurations contributing to each billing entry.',
         'Databricks cluster/job/pool node types, SQL warehouse sizes and serverless settings require separate workspace API access; ARM exports only workspace tier.',
         'Storage accessTier is the account default. Per-blob tier overrides and object data are not read.',
         'GitHub Copilot plans/AI credits require GitHub billing/admin evidence and are not regional Azure deployment SKUs.',
@@ -366,7 +346,7 @@ function Export-ServiceSkuInventory {
         collectedAt = [datetime]::UtcNow.ToString('o')
         status = $(if ($failures.Count) { 'Partial' } else { 'Collected' })
         subscriptions = @($selected | Select-Object id, name, tenantId)
-        resources = @($resources.ToArray()); requirements = $coverage
+        resources = @($resources.ToArray())
         failures = @($failures.ToArray()); limitations = $limitations
     }
     $directory = New-Item -ItemType Directory -Path $Output -Force
@@ -390,11 +370,11 @@ function Export-ServiceSkuInventory {
             Set-Content -LiteralPath $csvPath -Encoding UTF8
     }
     $script:SkuTokenCache.Clear()
-    Write-Host "Saved $($resources.Count) resource configurations and $($coverage.Count) ranking requirements to '$($directory.FullName)'."
+    Write-Host "Saved $($resources.Count) resource configurations to '$($directory.FullName)'."
     if ($failures.Count) { throw "Export is PARTIAL: $($failures.Count) requests failed. Review failures in '$jsonPath'." }
     if (-not $resources.Count) { Write-Warning "No matching resources were found. Review subscription scope and Reader permissions before interpreting this as an empty inventory." }
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
-    Export-ServiceSkuInventory -Tenant $TenantId -Output $OutputDirectory -Subscriptions $SubscriptionId -Ranking $RankingCsv
+    Export-ServiceSkuInventory -Tenant $TenantId -Output $OutputDirectory -Subscriptions $SubscriptionId
 }
