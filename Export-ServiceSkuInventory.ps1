@@ -335,11 +335,7 @@ function Export-ServiceSkuInventory {
     $limitations = @(
         'Inventory is current configuration, not a reconstruction of historical ACR usage or a target-region availability check.',
         'Only enabled subscriptions visible to this Azure CLI identity in the requested tenant are included; tenant-wide completeness is not guaranteed.',
-        'Reader access at each selected subscription is recommended. Resource-scoped access can produce an incomplete discovery set.',
-        'Databricks cluster/job/pool node types, SQL warehouse sizes and serverless settings require separate workspace API access; ARM exports only workspace tier.',
-        'Storage accessTier is the account default. Per-blob tier overrides and object data are not read.',
-        'GitHub Copilot plans/AI credits require GitHub billing/admin evidence and are not regional Azure deployment SKUs.',
-        'Quota, customer eligibility, feature combinations and real-time target-region capacity still require separate validation.'
+        'Reader access at each selected subscription is recommended. Resource-scoped access can produce an incomplete discovery set.'
     )
     $document = [ordered]@{
         schemaVersion = 1; tenantId = $Tenant.ToString(); startedAt = $started
